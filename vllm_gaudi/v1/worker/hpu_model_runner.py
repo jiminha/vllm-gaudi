@@ -360,9 +360,8 @@ class HpuModelAdapter(torch.nn.Module):
 
         # FusedSDPA with window_size is only supported when the length
         # of the input_token is multiple of the slice_size
-        if (self.use_window_sdpa and seq_len >= self.slice_thld
-            and self.slice_size != 0 and (seq_len % self.slice_size == 0)
-            and attn_metadata.block_list is None):
+        if (self.use_window_sdpa and seq_len >= self.slice_thld and self.slice_size != 0
+                and (seq_len % self.slice_size == 0) and attn_metadata.block_list is None):
             # no need to set sliding window mask, just use built-in window-sdpa
             return attn_metadata
 
@@ -370,50 +369,44 @@ class HpuModelAdapter(torch.nn.Module):
         shift = 0
 
         if self.prefill_use_fusedsdpa and attn_metadata.block_list is not None:
+
+            # print(f"jj {seq_len=}, {context_lens_t=}, {seq_lens_t=}")
             seq_lens_t = prefill_metadata.seq_lens_tensor
             context_lens_t = prefill_metadata.context_lens_tensor
-
-            # print(f"jj {context_lens_t=}, {seq_lens_t=}")
-            # print(f"jj {(context_lens_t + seq_lens_t <= self.sliding_window)}")
             # TODO: This doesn't seem to work with HPU Graph on.
             # if (context_lens_t + seq_lens_t <= self.sliding_window).all():
             #     import pdb;pdb.set_trace()
             #     print("RETURN 1")
             #     return attn_metadata
             block_list = attn_metadata.block_list
-            max_context_len = (block_list.size(-1) //
-                               batch_size if block_list is not None else 0)
+            max_context_len = (block_list.size(-1) // batch_size if block_list is not None else 0)
             max_context_len = max_context_len * self.block_size
 
             invalid_lens_t = context_lens_t - window_size + torch.arange(seq_len, device=device) - 1
 
             past_indices = torch.arange(max_context_len, device=device)
-            past_mask = ((past_indices.unsqueeze(0) > invalid_lens_t.unsqueeze(-1)) & 
-             (past_indices.unsqueeze(0) < context_lens_t.unsqueeze(-1).unsqueeze(0))
-            ).unsqueeze(1)
+            past_mask = ((past_indices.unsqueeze(0) > invalid_lens_t.unsqueeze(-1)) &
+                         (past_indices.unsqueeze(0) < context_lens_t.unsqueeze(-1).unsqueeze(0))).unsqueeze(1)
 
             # Create boolean sliding window mask
             causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=shift)
             causal_mask = torch.triu(causal_mask, diagonal=shift - window_size + 1)
-            
-            len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).lt(seq_lens_t.unsqueeze(-1)).view( batch_size, 1, 1, seq_len))
-            final_mask = causal_mask.logical_and(len_mask)
 
-            mask = torch.concat((past_mask, final_mask), dim=-1)
+            len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).lt(
+                seq_lens_t.unsqueeze(-1)).view(batch_size, 1, 1, seq_len))
+            causal_mask = causal_mask.logical_and(len_mask)
+
+            mask = torch.concat((past_mask, causal_mask), dim=-1)
             attn_bias = torch.where(mask, 0.0, float('-inf'))
 
         else:
-            # MASK without blocking padding. 
-            #causal + window size
-            tensor = torch.full((batch_size, 1, seq_len, seq_len),
-                                device=device,
-                                dtype=dtype,
-                                fill_value=1)
+            # OPTION1 - CAUSAL MASK without removing padding (CAUSAL+sliding window)
+            tensor = torch.full((batch_size, 1, seq_len, seq_len), device=device, dtype=dtype, fill_value=1)
             mask = torch.tril(tensor, diagonal=shift)
             mask = torch.triu(mask, diagonal=shift - window_size + 1)
             attn_bias = torch.log(mask)
             '''
-            # CAUSAL mask with sliding_window removing K padding - Accuracy with large padding (15images)
+            # OPTION2 - CAUSAL mask with sliding_window removing K padding - accuracy issue with # of images 15 and above
             seq_lens_t = prefill_metadata.seq_lens_tensor
 
             causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=shift)
