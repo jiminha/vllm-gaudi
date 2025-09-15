@@ -580,10 +580,13 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                                                      value_cache,
                                                      attn_metadata.block_size)
 
-            if self.sliding_window and seq_len > self.sliding_window:
+            if self.sliding_window:
                 if hasattr(attn_metadata, 'window_attn_bias'
                            ) and attn_metadata.window_attn_bias is not None:
                     attn_bias = attn_metadata.window_attn_bias
+
+                '''
+                # TODO: Only when FusedSDPA with sliding_window is enabled.
                 else:
                     attn_bias = None
                     window_size = (self.sliding_window, 0)
@@ -596,6 +599,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                         key = key.repeat_interleave(repeat_kv, dim=1)
                         value = value.repeat_interleave(repeat_kv, dim=1)
                         kv_shape = query_shape
+                '''
 
             out = ops.prompt_attention(
                 impl=self.prefill_impl,
