@@ -397,7 +397,9 @@ class HpuModelAdapter(torch.nn.Module):
             causal_mask = causal_mask.logical_and(len_mask)
 
             mask = torch.concat((past_mask, causal_mask), dim=-1)
-            attn_bias = torch.where(mask, 0.0, float('-inf'))
+            #attn_bias = torch.where(mask, 0.0, float('-inf'))
+            attn_bias = torch.where(mask, torch.tensor(0.0, dtype=dtype), torch.tensor(float('-inf'), dtype=dtype))
+
 
         else:
             # OPTION1 - CAUSAL MASK without removing padding (CAUSAL+sliding window)
@@ -414,7 +416,7 @@ class HpuModelAdapter(torch.nn.Module):
             len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).lt(seq_lens_t.unsqueeze(-1)).view( batch_size, 1, 1, seq_len))
             final_mask = causal_mask.logical_and(len_mask)
 
-            attn_bias = torch.where(final_mask, 0.0, float('-inf'))
+            attn_bias = torch.where(mask, torch.tensor(0.0, dtype=dtype), torch.tensor(float('-inf'), dtype=dtype))
             '''
         attn_metadata = prefill_metadata._replace(window_attn_bias=attn_bias)
         return attn_metadata
