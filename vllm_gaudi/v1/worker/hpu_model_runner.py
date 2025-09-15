@@ -355,13 +355,14 @@ class HpuModelAdapter(torch.nn.Module):
 
     def _set_attn_bias_for_sliding_window(self, attn_metadata, batch_size, seq_len, window_size, device, dtype):
 
-        if (attn_metadata is None or not attn_metadata.is_prompt) or (seq_len <= window_size):
+        if (attn_metadata is None or not attn_metadata.is_prompt):
             return attn_metadata
 
         # FusedSDPA with window_size is only supported when the length
         # of the input_token is multiple of the slice_size
-        if (self.use_window_sdpa and seq_len >= self.slice_thld and self.slice_size != 0
-                and (seq_len % self.slice_size == 0)):
+        if (self.use_window_sdpa and seq_len >= self.slice_thld
+            and self.slice_size != 0 and (seq_len % self.slice_size == 0)
+            and attn_metadata.block_list is None):
             # no need to set sliding window mask, just use built-in window-sdpa
             return attn_metadata
 
@@ -369,37 +370,59 @@ class HpuModelAdapter(torch.nn.Module):
         shift = 0
 
         if self.prefill_use_fusedsdpa and attn_metadata.block_list is not None:
-            prefill_metadata = attn_metadata
-
+            seq_lens_t = prefill_metadata.seq_lens_tensor
             context_lens_t = prefill_metadata.context_lens_tensor
 
+            # print(f"jj {context_lens_t=}, {seq_lens_t=}")
+            # print(f"jj {(context_lens_t + seq_lens_t <= self.sliding_window)}")
+            # TODO: This doesn't seem to work with HPU Graph on.
+            # if (context_lens_t + seq_lens_t <= self.sliding_window).all():
+            #     import pdb;pdb.set_trace()
+            #     print("RETURN 1")
+            #     return attn_metadata
             block_list = attn_metadata.block_list
-            max_context_len = (block_list.size(-1) // batch_size if block_list is not None else 0)
+            max_context_len = (block_list.size(-1) //
+                               batch_size if block_list is not None else 0)
             max_context_len = max_context_len * self.block_size
 
-            past_mask = torch.triu(torch.ones((batch_size, 1, seq_len, max_context_len), device=device),
-                                   diagonal=window_size + 1)
+            invalid_lens_t = context_lens_t - window_size + torch.arange(seq_len, device=device) - 1
 
-            # Apply per-sample context length masking
-            context_range = torch.arange(max_context_len, device=device)
-            valid_mask = context_range < context_lens_t.view(-1, 1, 1, 1)
-            past_mask = torch.where(valid_mask, past_mask, 0)
+            past_indices = torch.arange(max_context_len, device=device)
+            past_mask = ((past_indices.unsqueeze(0) > invalid_lens_t.unsqueeze(-1)) & 
+             (past_indices.unsqueeze(0) < context_lens_t.unsqueeze(-1).unsqueeze(0))
+            ).unsqueeze(1)
 
-            # Create the second mask (causal mask for seq_len x seq_len)
-            tensor = torch.ones((batch_size, 1, seq_len, seq_len), device=device)
-            causal_mask = torch.tril(tensor, diagonal=shift)
+            # Create boolean sliding window mask
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=shift)
             causal_mask = torch.triu(causal_mask, diagonal=shift - window_size + 1)
+            
+            len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).lt(seq_lens_t.unsqueeze(-1)).view( batch_size, 1, 1, seq_len))
+            final_mask = causal_mask.logical_and(len_mask)
 
-            # Concatenate along the last dimension
-            attn_bias = torch.cat((past_mask, causal_mask), dim=-1)
-            attn_bias = torch.log(attn_bias)
+            mask = torch.concat((past_mask, final_mask), dim=-1)
+            attn_bias = torch.where(mask, 0.0, float('-inf'))
+
         else:
+            # MASK without blocking padding. 
             #causal + window size
-            tensor = torch.full((batch_size, 1, seq_len, seq_len), device=device, dtype=dtype, fill_value=1)
+            tensor = torch.full((batch_size, 1, seq_len, seq_len),
+                                device=device,
+                                dtype=dtype,
+                                fill_value=1)
             mask = torch.tril(tensor, diagonal=shift)
             mask = torch.triu(mask, diagonal=shift - window_size + 1)
             attn_bias = torch.log(mask)
+            '''
+            # CAUSAL mask with sliding_window removing K padding - Accuracy with large padding (15images)
+            seq_lens_t = prefill_metadata.seq_lens_tensor
 
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=shift)
+            causal_mask = torch.triu(causal_mask, diagonal=shift - window_size + 1)
+            len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).lt(seq_lens_t.unsqueeze(-1)).view( batch_size, 1, 1, seq_len))
+            final_mask = causal_mask.logical_and(len_mask)
+
+            attn_bias = torch.where(final_mask, 0.0, float('-inf'))
+            '''
         attn_metadata = prefill_metadata._replace(window_attn_bias=attn_bias)
         return attn_metadata
 
@@ -1243,7 +1266,7 @@ class HPUModelRunner:
 
             self.encoder_cache[mm_hash] = scatter_mm_placeholders(
                 output,
-                is_embed=pos_info.is_embed,
+                is_embed=pos_info.is_embed.to("hpu"),
             )
 
     # modified from: vllm/v1/worker/gpu_model_runner.py
