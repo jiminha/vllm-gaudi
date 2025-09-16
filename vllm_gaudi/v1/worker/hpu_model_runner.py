@@ -368,16 +368,18 @@ class HpuModelAdapter(torch.nn.Module):
         prefill_metadata = attn_metadata
         shift = 0
 
+        seq_lens_t = prefill_metadata.seq_lens_tensor
+        context_lens_t = prefill_metadata.context_lens_tensor
+        print(f"jj {seq_len=}, {context_lens_t=}, {seq_lens_t=}")
+        
         if self.prefill_use_fusedsdpa and attn_metadata.block_list is not None:
 
-            # print(f"jj {seq_len=}, {context_lens_t=}, {seq_lens_t=}")
-            seq_lens_t = prefill_metadata.seq_lens_tensor
-            context_lens_t = prefill_metadata.context_lens_tensor
             # TODO: This doesn't seem to work with HPU Graph on.
             # if (context_lens_t + seq_lens_t <= self.sliding_window).all():
             #     import pdb;pdb.set_trace()
             #     print("RETURN 1")
             #     return attn_metadata
+            #import pdb;pdb.set_trace()
             block_list = attn_metadata.block_list
             max_context_len = (block_list.size(-1) // batch_size if block_list is not None else 0)
             max_context_len = max_context_len * self.block_size
@@ -391,14 +393,16 @@ class HpuModelAdapter(torch.nn.Module):
             # Create boolean sliding window mask
             causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=shift)
             causal_mask = torch.triu(causal_mask, diagonal=shift - window_size + 1)
+            causal_mask = causal_mask.view(batch_size, 1, seq_len, seq_len)
 
+            # TODO: Investigate further - Removing Padding cause accuracy issue
             len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).lt(
                 seq_lens_t.unsqueeze(-1)).view(batch_size, 1, 1, seq_len))
             causal_mask = causal_mask.logical_and(len_mask)
 
             mask = torch.concat((past_mask, causal_mask), dim=-1)
-            #attn_bias = torch.where(mask, 0.0, float('-inf'))
-            attn_bias = torch.where(mask, torch.tensor(0.0, dtype=dtype), torch.tensor(float('-inf'), dtype=dtype))
+            attn_bias = torch.where(mask, torch.tensor(0.0, dtype=dtype, device=device), 
+                                    torch.tensor(float('-inf'), dtype=dtype, device=device))
 
 
         else:
@@ -416,7 +420,7 @@ class HpuModelAdapter(torch.nn.Module):
             len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).lt(seq_lens_t.unsqueeze(-1)).view( batch_size, 1, 1, seq_len))
             final_mask = causal_mask.logical_and(len_mask)
 
-            attn_bias = torch.where(mask, torch.tensor(0.0, dtype=dtype), torch.tensor(float('-inf'), dtype=dtype))
+            attn_bias = torch.where(final_mask, torch.tensor(0.0, dtype=dtype), torch.tensor(float('-inf'), dtype=dtype))
             '''
         attn_metadata = prefill_metadata._replace(window_attn_bias=attn_bias)
         return attn_metadata
@@ -531,7 +535,7 @@ class HpuModelAdapter(torch.nn.Module):
 
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
     return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(
-        *args, **kwargs), disable_tensor_cache=True) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
+        *args, **kwargs), disable_tensor_cache=False) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
             *args, **kwargs)
 
 
@@ -2211,6 +2215,11 @@ class HPUModelRunner:
             # no hpu graphs for t.compile?
             use_graphs = False
         trimmed_attn_metadata = attn_metadata if self.unified_attn else trim_attn_metadata(attn_metadata)
+
+        seq_lens_t = attn_metadata.seq_lens_tensor
+        context_lens_t = attn_metadata.context_lens_tensor
+        #print(f"jj model_forward: {seq_len=}, {context_lens_t=}, {seq_lens_t=}")
+
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
                                 f"bs{batch_size}_"
@@ -2226,7 +2235,7 @@ class HPUModelRunner:
                                                kv_caches=kv_caches,
                                                inputs_embeds=inputs_embeds,
                                                model_mm_kwargs=model_mm_kwargs,
-                                               lora_mask=lora_mask)
+                                               lora_mask=lora_mask, **additional_kwargs)
         # NOTE(kzawora): returning hidden_states is required in prompt logprobs
         # scenarios, as they will do logit processing on their own
         non_flattened_hidden_states = hidden_states

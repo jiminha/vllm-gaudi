@@ -22,6 +22,8 @@ class LinearBucketingStrategy:
                                                        step=block_size,
                                                        max=max_model_len)
         max_ctx = math.ceil((max_model_len - prompt_query_bucket_cfg[0]) // block_size)
+        print(f"jj {prompt_query_bucket_cfg=}, {max_model_len=}, {block_size=}, {max_ctx=}")
+
         prompt_ctx_bucket_cfg = [0, 1, max_ctx]
 
         if use_merged_prefill:
