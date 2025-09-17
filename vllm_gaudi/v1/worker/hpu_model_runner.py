@@ -403,22 +403,31 @@ class HpuModelAdapter(torch.nn.Module):
             mask = torch.concat((past_mask, causal_mask), dim=-1)
             attn_bias = torch.where(mask, torch.tensor(0.0, dtype=dtype, device=device), 
                                     torch.tensor(float('-inf'), dtype=dtype, device=device))
-
-
         else:
+
             # OPTION1 - CAUSAL MASK without removing padding (CAUSAL+sliding window)
             tensor = torch.full((batch_size, 1, seq_len, seq_len), device=device, dtype=dtype, fill_value=1)
             mask = torch.tril(tensor, diagonal=shift)
             mask = torch.triu(mask, diagonal=shift - window_size + 1)
             attn_bias = torch.log(mask)
             '''
-            # OPTION2 - CAUSAL mask with sliding_window removing K padding - accuracy issue with # of images 15 and above
+            # OPTION2 - CAUSAL mask with sliding_window removing K padding - accuracy issue 
             seq_lens_t = prefill_metadata.seq_lens_tensor
 
             causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=shift)
             causal_mask = torch.triu(causal_mask, diagonal=shift - window_size + 1)
             len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).lt(seq_lens_t.unsqueeze(-1)).view( batch_size, 1, 1, seq_len))
             final_mask = causal_mask.logical_and(len_mask)
+
+            row_indices = torch.arange(seq_len, device=device).view(1, seq_len, 1)
+            col_indices = torch.arange(seq_len, device=device).view(1, 1, seq_len)
+            seq_lens_expanded = seq_lens_t.view(batch_size, 1, 1)
+
+            # Mask for rows > seq_len_orig AND columns <= seq_len_orig
+            padding_rows_valid_cols = (row_indices >= seq_lens_expanded) & (col_indices < seq_lens_expanded)
+
+            # Apply the modification
+            final_mask = final_mask | padding_rows_valid_cols.unsqueeze(1)
 
             attn_bias = torch.where(final_mask, torch.tensor(0.0, dtype=dtype), torch.tensor(float('-inf'), dtype=dtype))
             '''
@@ -535,7 +544,7 @@ class HpuModelAdapter(torch.nn.Module):
 
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
     return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(
-        *args, **kwargs), disable_tensor_cache=False) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
+        *args, **kwargs), disable_tensor_cache=True) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
             *args, **kwargs)
 
 
