@@ -535,10 +535,12 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             block_list = attn_metadata.block_list if attn_metadata \
                 and attn_metadata.block_list is not None else None
 
+            '''
             if self.sliding_window \
                and attn_metadata.window_attn_bias is not None:
                 attn_bias = attn_metadata.window_attn_bias
 
+            '''
             out = ops.prompt_attention(impl=self.prefill_impl,
                                        query=query.view(query_shape),
                                        key=key.view(kv_shape),
@@ -552,6 +554,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
 
             output = out.reshape(batch_size, seq_len, hidden_size)
         else:
+            '''
             # Decoding run.
             if not self.sliding_window:
                 block_list = attn_metadata.block_list
@@ -563,6 +566,11 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 block_groups = attn_metadata.window_block_groups
                 block_mapping = attn_metadata.window_block_mapping
                 attn_bias = attn_metadata.window_attn_bias
+            '''
+            block_list = attn_metadata.block_list
+            block_groups = attn_metadata.block_groups
+            block_mapping = attn_metadata.block_mapping
+            attn_bias = attn_metadata.attn_bias
 
             self.position_bias = None
             alibi_blocks = getattr(attn_metadata, 'alibi_blocks', None)
