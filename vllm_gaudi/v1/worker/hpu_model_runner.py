@@ -469,21 +469,20 @@ class HpuModelAdapter(torch.nn.Module, KVConnectorModelRunnerMixin):
             max_context_len = (block_list.size(-1) // batch_size if block_list is not None else 0)
             max_context_len = max_context_len * self.block_size
 
-            invalid_lens_t = context_lens_t - window_size + torch.arange(seq_len, device=device) - 1
+            seq_indices = torch.arange(seq_len, device=device, dtype=context_lens_t.dtype)
+            seq_indices = seq_indices.unsqueeze(0).expand(batch_size, -1)  # [batch_size, seq_len]
+            invalid_lens_t = context_lens_t.unsqueeze(1) - window_size + seq_indices - 1  # [batch_size, seq_len]
+
             past_indices = torch.arange(max_context_len, device=device)
-            past_mask = ((past_indices.unsqueeze(0) > invalid_lens_t.unsqueeze(-1)) &
-                         (past_indices.unsqueeze(0) < context_lens_t.unsqueeze(-1).unsqueeze(0))).unsqueeze(1)
+            past_indices_expanded = past_indices.unsqueeze(0).unsqueeze(0)  # [1, 1, max_context_len]
+            invalid_lens_expanded = invalid_lens_t.unsqueeze(-1)  # [batch_size, seq_len, 1]
+            context_lens_mask = context_lens_t.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1]
 
-            # Create boolean sliding window mask
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=shift)
+            past_mask = ((past_indices_expanded > invalid_lens_expanded) &
+                     (past_indices_expanded < context_lens_mask)).unsqueeze(1)
+
+            causal_mask = torch.tril(torch.ones(batch_size, 1, seq_len, seq_len, dtype=torch.bool, device=device), diagonal=shift)
             causal_mask = torch.triu(causal_mask, diagonal=shift - window_size + 1)
-            causal_mask = causal_mask.view(batch_size, 1, seq_len, seq_len)
-
-            # TODO: Investigate further - Removing Padding cause accuracy issue
-            # seq_lens_t = prefill_metadata.seq_lens_tensor
-            # len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).lt(
-            #     seq_lens_t.unsqueeze(-1)).view(batch_size, 1, 1, seq_len))
-            # causal_mask = causal_mask.logical_and(len_mask)
 
             mask = torch.concat((past_mask, causal_mask), dim=-1)
             attn_bias = torch.where(mask, torch.tensor(0.0, dtype=dtype, device=device),
