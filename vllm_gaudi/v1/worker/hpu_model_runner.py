@@ -1150,7 +1150,8 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
     attention_metadata = subtuple(metadata, 'TrimmedAttentionMetadata', [
         'attn_bias', 'seq_lens_tensor', 'context_lens_tensor', 'block_list', 'block_mapping', 'block_usage',
         'slot_mapping', 'is_prompt', 'block_size', 'block_groups', 'window_block_list', 'window_block_mapping',
-        'window_block_usage', 'window_block_groups', 'window_attn_bias', 'chunked_block_mapping', 'chunked_attn_bias',
+        'window_block_usage', 'window_block_groups', 'window_block_head_usage', 'window_attn_bias',
+        'chunked_block_mapping', 'chunked_attn_bias',
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
         'has_initial_states_p', 'last_chunk_indices_p', 'load_indices_tensor', 'store_indices_tensor',
         'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
@@ -2417,7 +2418,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                       slot_mapping,
                                       batch_size,
                                       block_size=None,
-                                      force_non_contiguous=False):
+                                      force_non_contiguous=False,
+                                      window_head_size=None):
         """Build paged attention buffers for decode.
 
         Args:
@@ -2425,14 +2427,31 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 use_contiguous_pa is enabled. Required for sliding window blocks
                 which have scattered block IDs that don't work with contiguous PA's
                 slice-based fetch.
+            window_head_size: If set (sliding_block_size in blocks), also compute
+                and return a per-block ``block_head_usage`` giving the count of
+                leading (oldest) positions in each request's oldest fetched window
+                block that fall BEFORE the start of the sliding window and must be
+                masked. It is ``lbu`` for the oldest block iff the request has a
+                full window (``len(bt) >= window_head_size``, i.e. the window
+                straddles the block boundary), else 0; 0 for every other block.
         """
         block_size = self.attn_block_size if block_size is None else block_size
         last_block_usage = [slot[0] % block_size + 1 for slot in slot_mapping]
         block_groups = [[i] * len(bt) for i, bt in enumerate(block_tables)]
         block_usage = [[block_size] * (len(bt) - 1) + [lbu] for bt, lbu in zip(block_tables, last_block_usage) if bt]
+        block_head_usage = None
+        if window_head_size is not None:
+            # Oldest window block first (block_tables[i] == block_table[-sliding:]),
+            # so the head-mask count goes on element 0; every other block is fully
+            # in-window (0). Only a request whose window straddles the oldest block
+            # boundary (len(bt) >= window_head_size) has stale leading tokens.
+            block_head_usage = [[(lbu if len(bt) >= window_head_size else 0)] + [0] * (len(bt) - 1)
+                                for bt, lbu in zip(block_tables, last_block_usage) if bt]
         block_list = flatten(block_tables)
         block_groups = flatten(block_groups)
         block_usage = flatten(block_usage)
+        if block_head_usage is not None:
+            block_head_usage = flatten(block_head_usage)
         assert len(block_list) == len(block_groups)
         assert len(block_list) == len(block_usage)
 
@@ -2493,6 +2512,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         block_list = torch.tensor(block_list, dtype=torch.long, device='cpu')
         block_groups = torch.tensor(block_groups, dtype=torch.long, device='cpu')
         block_usage = torch.tensor(block_usage, dtype=self.model_config.dtype, device='cpu')
+        if block_head_usage is not None:
+            # Pad blocks contribute no head-mask (pad value 0).
+            block_head_usage = padding_fn(block_head_usage, 0)
+            block_head_usage = torch.tensor(block_head_usage, dtype=self.model_config.dtype, device='cpu')
+            return block_list, block_groups, block_usage, block_head_usage
         return block_list, block_groups, block_usage
 
     def _align_and_pad_mrope_positions(self, req_ids: list[str], context_lens: list[int], query_lens: list[int],
@@ -3250,18 +3274,39 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
             # Adjust sliding block size for specific model types
             model_type = self._get_model_type()
-            if model_type is not None and model_type in ["gpt_oss"]:
+            # gemma4: a sliding_window-token window ending at a non-block-aligned
+            # decode position straddles sliding_window//block_size + 1 blocks.
+            # Without the +1 the oldest in-window block is masked during decode,
+            # which corrupts attention once generation exceeds the window and can
+            # trigger a degenerate repetition loop. The prefill/context path
+            # already adds this +1 for gemma4 (see ~L2759); decode must match.
+            # The extra block alone would OVER-cover (attend up to lbu stale
+            # tokens older than the window); window_head_size below adds the
+            # start-of-window mask so the decode attends EXACTLY the last
+            # sliding_window tokens.
+            if model_type is not None and model_type in ["gpt_oss", "gemma4"]:
                 sliding_block_size += 1
+
+            # gemma4 has sliding_window an exact multiple of block_size, so the
+            # start-of-window mask count is exactly lbu on the oldest block; gate
+            # the head-mask to gemma4 to avoid changing gpt_oss's existing (over-
+            # covering) behavior, whose window may not be block-aligned.
+            window_head_size = sliding_block_size if model_type == "gemma4" else None
 
             window_block_tables = [block_table[-sliding_block_size:] for block_table in block_tables_list]
             # Sliding window blocks have scattered IDs (not identity layout),
             # so force non-contiguous mode to use gather-by-id fetch
-            window_block_list, window_block_groups, window_block_usage = \
-                self.get_habana_paged_attn_buffers(
-                    window_block_tables, slot_mapping.tolist(),
-                    padded_batch_size * num_tokens,
-                    block_size=decode_block_size,
-                    force_non_contiguous=True)
+            window_block_head_usage = None
+            buffers = self.get_habana_paged_attn_buffers(
+                window_block_tables, slot_mapping.tolist(),
+                padded_batch_size * num_tokens,
+                block_size=decode_block_size,
+                force_non_contiguous=True,
+                window_head_size=window_head_size)
+            if window_head_size is not None:
+                window_block_list, window_block_groups, window_block_usage, window_block_head_usage = buffers
+            else:
+                window_block_list, window_block_groups, window_block_usage = buffers
 
         if self.model_has_chunked_attention:
             chunk_size_in_blocks = (self.model.model.config.text_config.attention_chunk_size // decode_block_size)
@@ -3330,6 +3375,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                    device=self.device) if self.interleaved_sliding_window else None
         window_block_groups_device = async_h2d_copy(window_block_groups,
                                                     device=self.device) if self.interleaved_sliding_window else None
+        window_block_head_usage_device = async_h2d_copy(
+            window_block_head_usage, device=self.device
+        ) if self.interleaved_sliding_window and window_block_head_usage is not None else None
         chunked_block_list_device = async_h2d_copy(chunked_block_list,
                                                    device=self.device) if self.model_has_chunked_attention else None
         chunked_block_usage_device = async_h2d_copy(chunked_block_usage,
@@ -3381,6 +3429,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             window_block_list=window_block_list_device,
             window_block_usage=window_block_usage_device,
             window_block_groups=window_block_groups_device,
+            window_block_head_usage=window_block_head_usage_device,
             chunked_block_list=chunked_block_list_device,
             chunked_block_usage=chunked_block_usage_device,
             chunked_block_groups=chunked_block_groups_device,
@@ -7712,9 +7761,11 @@ class HPUAttentionMetadataProcessor:
         Returns:
             Updated attention metadata with block_mapping and attn_bias set
         """
+        block_head_usage = None
         if is_window_block:
             block_usage = metadata.window_block_usage
             block_groups = metadata.window_block_groups
+            block_head_usage = getattr(metadata, "window_block_head_usage", None)
         elif update_for_chunked_attention:
             block_usage = metadata.chunked_block_usage
             block_groups = metadata.chunked_block_groups
@@ -7723,9 +7774,25 @@ class HPUAttentionMetadataProcessor:
             block_groups = metadata.block_groups
 
         block_size = getattr(metadata, "block_size", self.block_size)
-        mask = torch.arange(0, block_size, device=device, dtype=torch.int32).unsqueeze(0)
-        mask = mask >= block_usage.unsqueeze(-1)
-        attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -math.inf))
+        positions = torch.arange(0, block_size, device=device, dtype=torch.int32).unsqueeze(0)
+        # Trim the unused tail of each block's LAST slot (causal upper bound).
+        mask = positions >= block_usage.unsqueeze(-1)
+        if block_head_usage is not None:
+            # Sliding-window start-of-window (lower) bound: mask the leading
+            # positions of each request's oldest window block that fall before
+            # the window start, so decode attends EXACTLY the last sliding_window
+            # tokens (mirrors the prefill triu mask). Zero head_usage is a no-op.
+            mask = mask | (positions < block_head_usage.unsqueeze(-1))
+            # The head+tail mask CAN fully mask a block (the oldest window block
+            # is entirely out-of-window when p % block_size == block_size - 1).
+            # A block filled with -inf makes the paged-attn per-block online
+            # softmax compute sum(exp(-inf)) = 0 -> NaN, which then propagates.
+            # Use a large finite negative instead: exp() still underflows to 0 so
+            # a fully-masked block contributes ~0 weight, but no 0/0 arises.
+            fill_value = torch.finfo(dtype).min
+        else:
+            fill_value = -math.inf
+        attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, fill_value))
 
         if not is_fake_hpu():
             block_mapping = torch.nn.functional.one_hot(block_groups, num_classes=batch_size)

@@ -149,6 +149,10 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     window_block_groups: Optional[torch.Tensor] = None
     window_block_usage: Optional[torch.Tensor] = None
     window_attn_bias: Optional[torch.Tensor] = None
+    # Per-window-block count of leading (oldest) positions that fall BEFORE the
+    # start of the sliding window and must be masked out during decode. Nonzero
+    # only for each request's oldest fetched window block. See _set_block_mapping.
+    window_block_head_usage: Optional[torch.Tensor] = None
     chunked_slot_mapping: Optional[torch.Tensor] = None
     chunked_attn_bias: Optional[torch.Tensor] = None
     chunked_block_mapping: Optional[torch.Tensor] = None
