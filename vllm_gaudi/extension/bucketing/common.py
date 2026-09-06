@@ -181,11 +181,16 @@ class HPUBucketingManager():
                                                    self.mamba_chunk_size_is_explicit)
             self.log_generate_info(True)
             if self.use_sliding_window:
-                self.prompt_buckets = [
-                    t for t in self.prompt_buckets
-                    if t[2] != 0 or (t[2] == 0 and (t[1] < self.slice_thld or
-                                                    (t[1] >= self.slice_thld and t[1] % self.slice_size == 0)))
-                ]
+                # NATIVE window-sdpa (QKV-slice) needs seq_len % slice_size == 0. Snap the
+                # query dim UP to a multiple of slice_size instead of DROPPING non-aligned
+                # ctx=0 buckets, so a fresh ctx=0 prefill lands on an aligned ctx=0 bucket
+                # (block_list None -> native path) rather than a ctx>0 bucket (-> DENSE).
+                aligned = []
+                for _bs, _q, _ctx in self.prompt_buckets:
+                    if _q >= self.slice_thld and _q % self.slice_size != 0:
+                        _q = math.ceil(_q / self.slice_size) * self.slice_size
+                    aligned.append((_bs, _q, _ctx))
+                self.prompt_buckets = sorted(set(aligned))
                 self.log_generate_info(True)
         else:
             logger().info("Bucketing is off - skipping prompt buckets generation")
