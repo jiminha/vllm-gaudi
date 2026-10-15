@@ -13,10 +13,16 @@ Covers:
 * ``_try_schedule_encoder_inputs``: the decision table of the guard that keeps
   the capped chunk on the grid -- pass through, shrink (with mm items dropped
   and their encoder budget refunded), and defer when no grid boundary is left.
+* ``_grow_encoder_pool``: sizing the encoder pool above one worst-case mm item,
+  which is what stops a request's own small leading item from permanently
+  pricing out a max-size item behind it.
+
 These run on CPU; no Gaudi hardware required.
 """
 from types import SimpleNamespace
 from unittest import mock
+
+import pytest
 
 from vllm_gaudi.v1.core.sched.hpu_async_scheduler import HPUAsyncScheduler
 
@@ -190,3 +196,71 @@ def test_unknown_chunk_size_is_untouched():
     request = _request([(16, 16290)])
     base = ([], 16, BUDGET, [])
     assert _call(scheduler, request, num_computed_tokens=0, num_new_tokens=512, base_result=base) == base
+
+
+# ---------------------------------------------------------------------------
+# _grow_encoder_pool
+# ---------------------------------------------------------------------------
+
+
+def _pool_scheduler(budget=BUDGET, cache_size=BUDGET):
+    scheduler = object.__new__(HPUAsyncScheduler)
+    scheduler.max_num_encoder_input_tokens = budget
+    scheduler.encoder_cache_manager = SimpleNamespace(
+        cache_size=cache_size,
+        num_free_slots=cache_size,
+        num_freeable_slots=cache_size,
+    )
+    return scheduler
+
+
+@pytest.mark.parametrize("factor", [2, 4])
+def test_pool_growth_scales_budget_and_free_slots(factor):
+    scheduler = _pool_scheduler()
+    with mock.patch.dict("os.environ", {"VLLM_HPU_ENCODER_POOL_FACTOR": str(factor)}):
+        scheduler._grow_encoder_pool()
+
+    ecm = scheduler.encoder_cache_manager
+    assert scheduler.max_num_encoder_input_tokens == BUDGET * factor
+    assert ecm.cache_size == BUDGET * factor
+    # reset() restores both counters from cache_size, so they must agree with it.
+    assert ecm.num_free_slots == ecm.cache_size
+    assert ecm.num_freeable_slots == ecm.cache_size
+
+
+def test_pool_growth_can_be_disabled():
+    scheduler = _pool_scheduler()
+    with mock.patch.dict("os.environ", {"VLLM_HPU_ENCODER_POOL_FACTOR": "1"}):
+        scheduler._grow_encoder_pool()
+
+    assert scheduler.max_num_encoder_input_tokens == BUDGET
+    assert scheduler.encoder_cache_manager.cache_size == BUDGET
+
+
+def test_pool_growth_skips_text_only_models():
+    """A text-only model has no encoder budget; growing it must stay a no-op."""
+    scheduler = _pool_scheduler(budget=0, cache_size=0)
+    with mock.patch.dict("os.environ", {"VLLM_HPU_ENCODER_POOL_FACTOR": "4"}):
+        scheduler._grow_encoder_pool()
+
+    assert scheduler.max_num_encoder_input_tokens == 0
+    assert scheduler.encoder_cache_manager.cache_size == 0
+
+
+def test_grown_pool_admits_a_thumbnail_plus_a_max_size_item():
+    """Why the growth matters, in the terms can_allocate() uses.
+
+    can_allocate() rejects an item whose own embed count exceeds the budget
+    left after earlier items in the same step were admitted. At the default
+    floor the pool holds exactly one worst-case image, so a 64-embed thumbnail
+    admitted first makes a 16384-embed image unschedulable in every step.
+    """
+    thumb, giant = 64, BUDGET
+    assert giant > BUDGET - thumb, "precondition: the pair does not fit at the floor"
+
+    scheduler = _pool_scheduler()
+    with mock.patch.dict("os.environ", {"VLLM_HPU_ENCODER_POOL_FACTOR": "2"}):
+        scheduler._grow_encoder_pool()
+
+    assert giant <= scheduler.max_num_encoder_input_tokens - thumb
+    assert thumb + giant <= scheduler.encoder_cache_manager.num_free_slots

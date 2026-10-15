@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 from collections.abc import Iterable
 from functools import cached_property
 
@@ -11,6 +12,49 @@ logger = init_logger()
 
 
 class HPUAsyncScheduler(AsyncScheduler):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._grow_encoder_pool()
+
+    def _grow_encoder_pool(self) -> None:
+        """HPU override: let the encoder pool hold more than one worst-case item.
+
+        Upstream derives the per-step encoder compute budget and the encoder
+        cache size from max_num_batched_tokens, then floors both at the largest
+        single mm item (``compute_mm_encoder_budget``). HPU runs a small token
+        batch, so both land exactly on that floor and the pool holds exactly one
+        worst-case image (16384 embeds for Qwen3.5's 16777216-pixel limit).
+
+        ``can_allocate`` compares an item's own embed count against the budget
+        left after earlier items in the same step were admitted. At the floor, a
+        request whose small leading thumbnail is admitted first can therefore
+        never fit a max-size image behind it: the cap clips the chunk to that
+        image's offset, the offset is inside the first chunk so there is no grid
+        boundary to shrink to, and the step is dropped identically forever.
+        Growing the pool removes that livelock and halves how often the cap
+        fires under concurrency.
+
+        Only the scheduler's own budget and the cache manager's counters are
+        touched, never scheduler_config: the runner reads
+        ``scheduler_config.max_num_encoder_input_tokens`` for max_encoder_len
+        and the cross-attention KV spec is derived from it. The runner's encoder
+        cache is a lazily populated dict, so raising the ceiling costs nothing
+        until the extra residency is used.
+        """
+        factor = int(os.environ.get("VLLM_HPU_ENCODER_POOL_FACTOR", "2"))
+        if factor <= 1 or not self.max_num_encoder_input_tokens:
+            return
+        ecm = self.encoder_cache_manager
+        grown = ecm.cache_size * factor
+        delta = grown - ecm.cache_size
+        # reset() restores both counters from cache_size, so this survives it.
+        ecm.cache_size = grown
+        ecm.num_free_slots += delta
+        ecm.num_freeable_slots += delta
+        self.max_num_encoder_input_tokens *= factor
+        logger.info("Grew encoder pool %dx: cache %d embeds, per-step budget %d embeds.", factor, ecm.cache_size,
+                    self.max_num_encoder_input_tokens)
 
     def schedule(self, throttle_prefills: bool = False):
         """HPU override: fix stale cached-token accounting after preemption.
